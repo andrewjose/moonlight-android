@@ -1,0 +1,127 @@
+# Builds a sideloadable Artemis test APK from the latest upstream source
+# (ClassicOldSong/moonlight-android, branch moonlight-noir by default).
+#
+# - Package id is changed to com.limelight.noirtest ("Artemis Test") so it installs
+#   NEXT TO the official Artemis (com.limelight.noir) and never touches its data.
+# - Signed with .github/test-signing/test.keystore. This is a throwaway TEST key,
+#   not a release key; it is committed so every run installs over the previous one.
+# - Each run publishes a GitHub prerelease with the APKs attached.
+#
+# Run it: Actions -> "Artemis test APK" -> Run workflow.
+
+name: Artemis test APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Source repo"
+        default: "ClassicOldSong/moonlight-android"
+      upstream_ref:
+        description: "Branch, tag or commit"
+        default: "moonlight-noir"
+  push:
+    branches: [moonlight-noir]
+    paths: [".github/workflows/test-apk.yml"]
+
+permissions:
+  contents: write
+
+env:
+  SRC_REPO: ${{ inputs.upstream_repo || 'ClassicOldSong/moonlight-android' }}
+  SRC_REF: ${{ inputs.upstream_ref || 'moonlight-noir' }}
+  NDK_VERSION: "27.0.12077973"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (signing key)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Checkout Artemis source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          submodules: recursive
+          path: src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install NDK / SDK packages (with retries)
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          for i in 1 2 3 4; do
+            "$SDKM" --install "ndk;${NDK_VERSION}" "platforms;android-36" "build-tools;36.0.0" > /dev/null && break
+            echo "sdkmanager attempt $i failed, retrying"; sleep 15
+          done
+          test -d "$ANDROID_HOME/ndk/${NDK_VERSION}"
+
+      - name: Patch package id, label and version
+        working-directory: src
+        run: |
+          SHA=$(git rev-parse --short=7 HEAD)
+          echo "SRC_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "SRC_DATE=$(git log -1 --format=%cs)" >> "$GITHUB_ENV"
+          G=app/build.gradle
+          sed -i 's/applicationIdSuffix "\.noir"$/applicationIdSuffix ".noirtest"/' $G
+          sed -i '/"app_label/ s/"Artemis/"Artemis Test/' $G
+          sed -i -E "s/versionName \"([^\"]+)\"/versionName \"\1-git${SHA}\"/" $G
+          grep -q 'applicationIdSuffix ".noirtest"' $G || { echo "package id patch failed"; exit 1; }
+          grep -nE 'applicationIdSuffix|app_label"|versionName' $G
+
+      - name: Build release APKs
+        working-directory: src
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleNonRoot_gameRelease
+
+      - name: Align, sign and verify
+        working-directory: src
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          KS="$GITHUB_WORKSPACE/fork/.github/test-signing/test.keystore"
+          OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT"
+          shopt -s nullglob
+          APKS=(app/build/outputs/apk/nonRoot_game/release/*-unsigned.apk)
+          [ ${#APKS[@]} -gt 0 ] || { ls -R app/build/outputs/apk; exit 1; }
+          for u in "${APKS[@]}"; do
+            abi=$(basename "$u" | sed -E 's/.*nonRoot_game-(.+)-release-unsigned\.apk/\1/')
+            a="$RUNNER_TEMP/aligned-$abi.apk"
+            "$BT/zipalign" -f -p 4 "$u" "$a"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
+              --ks-key-alias artemistest --out "$OUT/$abi.apk" "$a"
+          done
+          ARM="$OUT/arm64-v8a.apk"
+          "$BT/apksigner" verify --print-certs "$ARM"
+          BADGE=$("$BT/aapt" dump badging "$ARM")
+          echo "$BADGE" | head -3
+          echo "$BADGE" | grep -q "package: name='com.limelight.noirtest'" || { echo "wrong package id"; exit 1; }
+          NAME=$(echo "$BADGE" | sed -nE "s/.*versionName='([^']+)'.*/\1/p")
+          CODE=$(echo "$BADGE" | sed -nE "s/.*versionCode='([^']+)'.*/\1/p")
+          echo "NAME=$NAME" >> "$GITHUB_ENV"; echo "CODE=$CODE" >> "$GITHUB_ENV"
+          cd "$OUT"
+          for f in *.apk; do mv "$f" "ArtemisTest-${NAME}-run${GITHUB_RUN_NUMBER}-${f}"; done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArtemisTest-${{ env.NAME }}-run${{ github.run_number }}
+          path: out/*.apk
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="test-v${NAME}-run${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" out/*.apk -R "$GITHUB_REPOSITORY" --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Artemis Test ${NAME} (${CODE}), run ${GITHUB_RUN_NUMBER}" \
+            --notes "Unofficial test build of ${SRC_REPO}@${SRC_SHA} (${SRC_DATE}). Package com.limelight.noirtest, installs next to official Artemis. Signed with a test key. Most phones: arm64-v8a."
