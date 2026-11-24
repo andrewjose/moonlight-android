@@ -5,7 +5,8 @@
 #   NEXT TO the official Artemis (com.limelight.noir) and never touches its data.
 # - Signed with .github/test-signing/test.keystore. This is a throwaway TEST key,
 #   not a release key; it is committed so every run installs over the previous one.
-# - Each run publishes a GitHub prerelease with the APKs attached.
+# - Each run publishes a normal GitHub release (marked Latest), so Obtainium sees it
+#   with default settings.
 #
 # Run it: Actions -> "Artemis test APK" -> Run workflow.
 
@@ -116,12 +117,12 @@ jobs:
           name: ArtemisTest-${{ env.NAME }}-run${{ github.run_number }}
           path: out/*.apk
 
-      - name: Publish prerelease
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="test-v${NAME}-run${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" out/*.apk -R "$GITHUB_REPOSITORY" --prerelease \
+          gh release create "$TAG" out/*.apk -R "$GITHUB_REPOSITORY" --latest \
             --target "$GITHUB_SHA" \
             --title "Artemis Test ${NAME} (${CODE}), run ${GITHUB_RUN_NUMBER}" \
             --notes "Unofficial test build of ${SRC_REPO}@${SRC_SHA} (${SRC_DATE}). Package com.limelight.noirtest, installs next to official Artemis. Signed with a test key. Most phones: arm64-v8a."
